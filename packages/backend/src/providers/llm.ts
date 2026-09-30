@@ -1,20 +1,24 @@
 // OpenAI-compatible chat calls, always through receipts. One model is enough: `default` is whatever the
 // deployment names in LLM_BASE_URL / LLM_API_KEY / LLM_MODEL, and every capability uses it unless an
 // environment variable or the admin's model page picks one of the named presets below.
-import type { z } from "zod";
+import { z } from "zod";
 import { config, credential } from "../config.ts";
 import { sha256 } from "../lib/ids.ts";
 import { completeReceipt, paidRequest, ProviderRejectedError, rejectReceivedResponse } from "./receipts.ts";
+import { runCodexExec } from "./codex-exec.ts";
 import { sql } from "../db.ts";
 
 export interface ModelSpec {
   key: string;
   service: string;
   model: string;
-  baseUrlEnv: string;
-  apiKeyEnv: string;
+  baseUrlEnv?: string;
+  apiKeyEnv?: string;
+  transport?: "http" | "codex-exec";
   /** Extra request fields, e.g. switching reasoning off for short structured tasks. */
   extra?: Record<string, unknown>;
+  /** Codex CLI reasoning effort when transport is codex-exec. */
+  codexReasoningEffort?: string;
   jsonMode: boolean;
   vision?: boolean;
 }
@@ -36,6 +40,13 @@ export const MODELS: Record<string, ModelSpec> = {
     get extra() { return extraFromEnv(process.env.LLM_EXTRA_JSON); },
     get jsonMode() { return process.env.LLM_JSON_MODE !== "false"; },
     get vision() { return process.env.LLM_VISION === "true"; },
+  },
+  // ChatGPT subscription path: no API key, one isolated Codex CLI turn per call. It is opt-in only;
+  // no capability selects this preset unless an operator chooses it explicitly.
+  "chatgpt-luna": {
+    key: "chatgpt-luna", service: "chatgpt-codex", transport: "codex-exec",
+    get model() { return process.env.CODEX_LUNA_MODEL ?? "gpt-5.6-luna"; },
+    codexReasoningEffort: "low", jsonMode: true, vision: false,
   },
   // Named presets (the models AIHOT itself runs on); each needs its own key.
   // GLM 5.3 Flash always reasons; the lowest effort keeps short structured tasks fast.
@@ -155,26 +166,20 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
   const spec = MODELS[opts.model];
   if (!spec) throw new Error(`Unknown model ${opts.model}`);
   if (!config.modelCallsEnabled) throw new Error("Model calls are disabled (MODEL_CALLS_ENABLED=false)");
-  const baseUrl = credential("models", spec.baseUrlEnv);
-  const apiKey = credential("models", spec.apiKeyEnv);
-  if (!baseUrl || !apiKey || !spec.model) throw new Error(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
+  if (!spec.model) throw new Error(`Model ${opts.model} is not configured`);
+
+  const codex = spec.transport === "codex-exec";
+  const baseUrl = codex || !spec.baseUrlEnv ? undefined : credential("models", spec.baseUrlEnv);
+  const apiKey = codex || !spec.apiKeyEnv ? undefined : credential("models", spec.apiKeyEnv);
+  if (!codex && (!baseUrl || !apiKey)) {
+    throw new Error(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
+  }
 
   const temperature = opts.temperature ?? 0.2;
   const maxTokens = Math.max(opts.maxTokens ?? 1500, 512) + (spec.key.endsWith("-think") ? 4000 : 0);
   const userText = typeof opts.user === "string" ? opts.user : JSON.stringify(opts.user);
-  const body: Record<string, unknown> = {
-    model: spec.model,
-    messages: [
-      // A prompt given as one user message (the title/summary prompts) has no system message.
-      ...(opts.system ? [{ role: "system", content: opts.system }] : []),
-      // Multimodal parts go through as parts; plain objects are sent as JSON text.
-      { role: "user", content: typeof opts.user === "string" || Array.isArray(opts.user) ? opts.user : userText },
-    ],
-    temperature,
-    max_tokens: maxTokens,
-    ...(spec.jsonMode && opts.json !== false ? { response_format: { type: "json_object" } } : {}),
-    ...(spec.extra ?? {}),
-  };
+  const outputSchema = codex && spec.jsonMode && opts.json !== false ? z.toJSONSchema(opts.schema) : undefined;
+  const outputSchemaHash = outputSchema === undefined ? null : sha256(JSON.stringify(outputSchema));
 
   const receipt = await paidRequest(
     {
@@ -182,17 +187,54 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
       model: spec.model,
       purpose: opts.purpose,
       subject: opts.subject,
-      identity: { model: spec.model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: spec.extra ?? null },
-      requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens },
+      identity: {
+        model: spec.model, transport: spec.transport ?? "http", promptVersion: opts.promptVersion,
+        system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: spec.extra ?? null,
+        codexReasoningEffort: spec.codexReasoningEffort ?? null, outputSchema: outputSchemaHash,
+      },
+      requestSummary: {
+        promptVersion: opts.promptVersion, transport: spec.transport ?? "http", systemHash: sha256(opts.system), userHash: sha256(userText),
+        userChars: userText.length, temperature, maxTokens, outputSchemaHash,
+      },
       attemptTag: opts.attemptTag,
     },
     async () => {
       const started = Date.now();
+      if (codex) {
+        const result = await runCodexExec({
+          model: spec.model,
+          system: opts.system,
+          user: userText,
+          outputSchema,
+          timeoutMs: opts.timeoutMs ?? 120_000,
+          reasoningEffort: spec.codexReasoningEffort,
+        });
+        return {
+          response: { choices: [{ message: { content: result.content }, finish_reason: "stop" }], _latencyMs: Date.now() - started },
+          usage: null,
+          cost: null,
+        };
+      }
+
+      const body: Record<string, unknown> = {
+        model: spec.model,
+        messages: [
+          // A prompt given as one user message (the title/summary prompts) has no system message.
+          ...(opts.system ? [{ role: "system", content: opts.system }] : []),
+          // Multimodal parts go through as parts; plain objects are sent as JSON text.
+          { role: "user", content: typeof opts.user === "string" || Array.isArray(opts.user) ? opts.user : userText },
+        ],
+        temperature,
+        max_tokens: maxTokens,
+        ...(spec.jsonMode && opts.json !== false ? { response_format: { type: "json_object" } } : {}),
+        ...(spec.extra ?? {}),
+      };
+
       let res: Response;
       try {
-        res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        res = await fetch(`${baseUrl!.replace(/\/$/, "")}/chat/completions`, {
           method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+          headers: { "content-type": "application/json", authorization: `Bearer ${apiKey!}` },
           body: JSON.stringify(body),
           signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
         });
