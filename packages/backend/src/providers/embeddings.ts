@@ -2,6 +2,7 @@
 // OpenAI-compatible /embeddings endpoint (EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL);
 // with a DashScope key and nothing else set, Aliyun text-embedding-v4 at 1024 dimensions. Without
 // either, recall falls back to the other signals (same address, replies and quotes).
+import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import { config, credential } from "../config.ts";
 import { sql } from "../db.ts";
 import { sha256 } from "../lib/ids.ts";
@@ -12,6 +13,7 @@ export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || (own ? "text-embed
 /** Requested dimensions, when the provider takes the parameter (0 leaves it to the model). */
 export const EMBEDDING_DIMS = Number(process.env.EMBEDDING_DIMS ?? (own ? 0 : 1024));
 const SERVICE = own ? "embedding" : "dashscope";
+const embeddingTransport = new EnvHttpProxyAgent();
 
 // Recall reads fresh fact/story titles on every call, so the full text hash also invalidates this
 // cache when either title changes. Keep enough entries for the 4,000-fact recall window, not the
@@ -26,20 +28,26 @@ function cacheFact(id: string, textHash: string, vector: number[]) {
   if (factVectors.size > FACT_CACHE_LIMIT) factVectors.delete(factVectors.keys().next().value!);
 }
 
-/** Embeddings are paid model calls: MODEL_CALLS_ENABLED=false switches them off like every other call. */
+// Explicit embedding opt-in does not enable unrelated LLM calls.
+function embeddingCallsEnabled(): boolean {
+  return process.env.EMBEDDINGS_ENABLED !== "false" &&
+    (config.modelCallsEnabled || (process.env.EMBEDDINGS_ENABLED === "true" && own));
+}
+
 export function embeddingsAvailable(): boolean {
-  return config.modelCallsEnabled && !!(credential("models", "EMBEDDING_API_KEY") ?? credential("models", "DASHSCOPE_API_KEY")) && process.env.EMBEDDINGS_ENABLED !== "false";
+  return embeddingCallsEnabled() && !!(credential("models", "EMBEDDING_API_KEY") ?? credential("models", "DASHSCOPE_API_KEY"));
 }
 
 async function embedBatch(texts: string[], subject: string): Promise<number[][]> {
-  if (!config.modelCallsEnabled) throw new Error("Model calls are disabled (MODEL_CALLS_ENABLED=false)");
+  if (!embeddingCallsEnabled()) throw new Error("Embedding calls are disabled");
   const base = own ? credential("models", "EMBEDDING_BASE_URL") ?? "https://api.openai.com/v1" : credential("models", "DASHSCOPE_BASE_URL") ?? "https://dashscope.aliyuncs.com/compatible-mode/v1";
   const key = own ? credential("models", "EMBEDDING_API_KEY") : credential("models", "DASHSCOPE_API_KEY");
   if (!key) throw new Error("EMBEDDING_API_KEY (or DASHSCOPE_API_KEY) missing");
   const receipt = await paidRequest(
     { service: SERVICE, model: EMBEDDING_MODEL, purpose: "embedding", subject, identity: { model: EMBEDDING_MODEL, dims: EMBEDDING_DIMS, texts: texts.map((t) => sha256(t)) }, requestSummary: { count: texts.length } },
     async () => {
-      const res = await fetch(`${base.replace(/\/$/, "")}/embeddings`, {
+      const res = await undiciFetch(`${base.replace(/\/$/, "")}/embeddings`, {
+        dispatcher: embeddingTransport,
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
         body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts, ...(EMBEDDING_DIMS > 0 ? { dimensions: EMBEDDING_DIMS } : {}), encoding_format: "float" }),
